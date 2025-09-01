@@ -1,58 +1,65 @@
-// scan.js — verbose pump watcher -> Apps Script
+// scan.js — program watcher with 2-step fetch to get full logs
 // Node 18+ has global fetch
 import fs from "fs";
 
 const HELIUS_KEY = process.env.HELIUS_KEY;
 const API = process.env.APPS_SCRIPT_API;
 
-if (!HELIUS_KEY || !API) {
-  console.error("[scan] Missing env vars. Helius?", !!HELIUS_KEY, "AppsScript?", !!API);
-  process.exit(1);
-}
-
-console.log("[scan] HELIUS_KEY set? ", !!HELIUS_KEY);
-console.log("[scan] APPS_SCRIPT_API: ", API);
-
-// ---- Candidate program IDs to probe (we'll see which returns logs) ----
-// NOTE: Pump.fun’s public “program id” people paste online is often wrong.
-// We’ll probe a few known/seen ids. We’ll learn the right one from logs.
-const CANDIDATE_PROGRAMS = [
-  "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P", // common placeholder people quote
-  // add more if you know them:
-  // "2oE5k........",  // (example)
+// <<< put your confirmed program id(s) here >>>
+const PROGRAM_IDS = [
+  "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
 ];
 
-// Very loose “bonding” matcher for first run; we’ll tighten after we see logs
-const BONDING_REGEX = /(bond|bonded|bonding|complete|completed|enable|enabled)/i;
+// Broad first-pass matcher; we’ll tighten once we see real lines
+const BONDING_REGEX = /(bond|bonded|bonding|curve|enable|enabled|complete|initialized)/i;
 
 const STATE_FILE = "last-pump.json";
 function loadState() {
-  try {
-    return JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
-  } catch {
-    return { seen: {} };
-  }
+  try { return JSON.parse(fs.readFileSync(STATE_FILE, "utf8")); } catch { return { seen: {} }; }
 }
-function saveState(s) {
-  fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 2));
-}
+function saveState(s) { fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 2)); }
 
-async function fetchRecentFor(addr) {
-  const url = `https://api.helius.xyz/v0/addresses/${addr}/transactions?api-key=${HELIUS_KEY}&limit=25`;
-  console.log(`[scan] GET ${url.replace(/\?.*/, "?api-key=***")}`);
-  const res = await fetch(url);
-  if (!res.ok) {
-    console.error("[scan] Helius error", res.status, await res.text());
+if (!HELIUS_KEY || !API) {
+  console.error("[scan] Missing env vars. HELIUS_KEY/APPS_SCRIPT_API");
+  process.exit(1);
+}
+console.log("[scan] HELIUS_KEY set? ", !!HELIUS_KEY);
+console.log("[scan] APPS_SCRIPT_API: ***");
+
+// ---- Helpers ----
+async function fetchAddressTxs(addr, limit = 25) {
+  const url = `https://api.helius.xyz/v0/addresses/${addr}/transactions?api-key=${HELIUS_KEY}&limit=${limit}`;
+  console.log("[scan] GET", url.replace(/\?.*/, "?api-key=***"));
+  const r = await fetch(url);
+  if (!r.ok) {
+    console.error("[scan] address txs error", r.status, await r.text());
     return [];
   }
-  const txs = await res.json();
-  console.log(`[scan] ${addr} -> ${txs.length} txs`);
-  return txs;
+  const txs = await r.json();
+  console.log(`[scan] ${addr} -> ${txs.length} light txs`);
+  return txs; // light objects with signature, maybe events/transfers but often no logs
 }
 
-// Extract a candidate mint if Helius parsed tokenTransfers for this tx
+async function fetchFullTxs(signatures) {
+  if (!signatures.length) return [];
+  // Helius full details with logs
+  const url = `https://api.helius.xyz/v0/transactions?api-key=${HELIUS_KEY}`;
+  const r = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(signatures),
+  });
+  if (!r.ok) {
+    console.error("[scan] full txs error", r.status, await r.text());
+    return [];
+  }
+  const full = await r.json();
+  console.log(`[scan] fetched ${full.length} full txs (with logs)`);
+  return full;
+}
+
 function mintFromTx(tx) {
-  // prefer first token transfer mint if present
+  // Try tokenTransfers/events first
   const m =
     tx?.tokenTransfers?.[0]?.mint ||
     tx?.events?.nft?.mint ||
@@ -67,7 +74,7 @@ async function addCoin(mint) {
     const r = await fetch(API, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
+      body: JSON.stringify(body)
     });
     const text = await r.text();
     if (!r.ok) {
@@ -85,40 +92,40 @@ async function addCoin(mint) {
 async function main() {
   const state = loadState();
 
-  for (const pid of CANDIDATE_PROGRAMS) {
-    const txs = await fetchRecentFor(pid);
+  for (const pid of PROGRAM_IDS) {
+    // Step 1: get recent signatures for the program id
+    const light = await fetchAddressTxs(pid, 25);
+    const sigs = light.map(t => t.signature).filter(Boolean);
+    if (!sigs.length) continue;
 
-    for (const tx of txs) {
+    // Step 2: fetch full transactions (includes meta.logMessages)
+    const full = await fetchFullTxs(sigs);
+
+    for (const tx of full) {
       const sig = tx?.signature || "(no sig)";
       const logs = tx?.meta?.logMessages || [];
-      const joined = logs.join(" | ");
-
-      // print a compact preview to learn what logs look like
       const preview = logs.slice(0, 3).join(" / ");
       console.log(`\n[scan] tx ${sig}`);
       console.log(`[scan]   preview logs: ${preview || "(no logs)"}`);
 
-      // First pass: look for any “bonding-ish” words
+      const joined = logs.join(" | ");
       if (!BONDING_REGEX.test(joined)) continue;
 
+      // Try to infer mint
       const mint = mintFromTx(tx);
       console.log(`[scan]   bonding-ish hit. inferred mint: ${mint || "(none)"}`);
 
       if (!mint) {
-        // We matched the logs but couldn’t infer mint. Print more to debug.
+        // If no mint, dump a couple more lines for us to refine extractor
         console.log("[scan]   FULL LOGS:", joined);
         continue;
       }
-
       if (state.seen[mint]) {
         console.log("[scan]   already seen", mint);
         continue;
       }
-
       const ok = await addCoin(mint);
-      if (ok) {
-        state.seen[mint] = Date.now();
-      }
+      if (ok) state.seen[mint] = Date.now();
     }
   }
 
@@ -126,7 +133,4 @@ async function main() {
   console.log("[scan] done");
 }
 
-main().catch((e) => {
-  console.error(e);
-  process.exit(1);
-});
+main().catch(e => { console.error(e); process.exit(1); });
