@@ -1,22 +1,17 @@
 // scan.js — program watcher with 2-step fetch to get full logs
-// Node 18+ has global fetch
 import fs from "fs";
 
 const HELIUS_KEY = process.env.HELIUS_KEY;
 const API = process.env.APPS_SCRIPT_API;
 
-// <<< put your confirmed program id(s) here >>>
 const PROGRAM_IDS = [
   "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
 ];
 
-// Broad first-pass matcher; we’ll tighten once we see real lines
 const BONDING_REGEX = /(bond|bonded|bonding|curve|enable|enabled|complete|initialized)/i;
 
 const STATE_FILE = "last-pump.json";
-function loadState() {
-  try { return JSON.parse(fs.readFileSync(STATE_FILE, "utf8")); } catch { return { seen: {} }; }
-}
+function loadState() { try { return JSON.parse(fs.readFileSync(STATE_FILE, "utf8")); } catch { return { seen: {} }; } }
 function saveState(s) { fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 2)); }
 
 if (!HELIUS_KEY || !API) {
@@ -37,17 +32,21 @@ async function fetchAddressTxs(addr, limit = 25) {
   }
   const txs = await r.json();
   console.log(`[scan] ${addr} -> ${txs.length} light txs`);
-  return txs; // light objects with signature, maybe events/transfers but often no logs
+  return txs;
 }
 
 async function fetchFullTxs(signatures) {
   if (!signatures.length) return [];
-  // Helius full details with logs
   const url = `https://api.helius.xyz/v0/transactions?api-key=${HELIUS_KEY}`;
+
+  // ✅ Helius expects { "transactions": ["sig1", "sig2", ...] }
+  const body = JSON.stringify({ transactions: signatures });
+
+  console.log(`[scan] fetching full txs for ${signatures.length} sigs`);
   const r = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(signatures),
+    body
   });
   if (!r.ok) {
     console.error("[scan] full txs error", r.status, await r.text());
@@ -59,7 +58,6 @@ async function fetchFullTxs(signatures) {
 }
 
 function mintFromTx(tx) {
-  // Try tokenTransfers/events first
   const m =
     tx?.tokenTransfers?.[0]?.mint ||
     tx?.events?.nft?.mint ||
@@ -93,12 +91,10 @@ async function main() {
   const state = loadState();
 
   for (const pid of PROGRAM_IDS) {
-    // Step 1: get recent signatures for the program id
     const light = await fetchAddressTxs(pid, 25);
     const sigs = light.map(t => t.signature).filter(Boolean);
     if (!sigs.length) continue;
 
-    // Step 2: fetch full transactions (includes meta.logMessages)
     const full = await fetchFullTxs(sigs);
 
     for (const tx of full) {
@@ -111,12 +107,10 @@ async function main() {
       const joined = logs.join(" | ");
       if (!BONDING_REGEX.test(joined)) continue;
 
-      // Try to infer mint
       const mint = mintFromTx(tx);
       console.log(`[scan]   bonding-ish hit. inferred mint: ${mint || "(none)"}`);
 
       if (!mint) {
-        // If no mint, dump a couple more lines for us to refine extractor
         console.log("[scan]   FULL LOGS:", joined);
         continue;
       }
