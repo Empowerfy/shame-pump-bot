@@ -12,7 +12,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-      - run: node scan.js
+      - name: Run scanner
+        run: node scan.js
         env:
           HELIUS_KEY: ${{ secrets.HELIUS_KEY }}
           APPS_SCRIPT_API: ${{ secrets.APPS_SCRIPT_API }}
