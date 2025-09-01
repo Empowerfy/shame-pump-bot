@@ -1,70 +1,132 @@
-// scan.js - polls Helius for Pump.fun coins and adds them to Google Sheets
-import fs from 'fs';
-const fetch = globalThis.fetch; // no node-fetch import
-
-
+// scan.js — verbose pump watcher -> Apps Script
+// Node 18+ has global fetch
+import fs from "fs";
 
 const HELIUS_KEY = process.env.HELIUS_KEY;
-const API = process.env.APPS_SCRIPT_API; // Apps Script /exec endpoint
+const API = process.env.APPS_SCRIPT_API;
 
 if (!HELIUS_KEY || !API) {
-  console.error("Missing HELIUS_KEY or APPS_SCRIPT_API env vars");
+  console.error("[scan] Missing env vars. Helius?", !!HELIUS_KEY, "AppsScript?", !!API);
   process.exit(1);
 }
 
-// Real Pump.fun BondingCurve program ID
-const PUMP_PROGRAM_IDS = [
-  "Pump111111111111111111111111111111111111111"
+console.log("[scan] HELIUS_KEY set? ", !!HELIUS_KEY);
+console.log("[scan] APPS_SCRIPT_API: ", API);
+
+// ---- Candidate program IDs to probe (we'll see which returns logs) ----
+// NOTE: Pump.fun’s public “program id” people paste online is often wrong.
+// We’ll probe a few known/seen ids. We’ll learn the right one from logs.
+const CANDIDATE_PROGRAMS = [
+  "Pump111111111111111111111111111111111111111", // common placeholder people quote
+  // add more if you know them:
+  // "2oE5k........",  // (example)
 ];
 
-const STATE_FILE = 'last-pump.json';
+// Very loose “bonding” matcher for first run; we’ll tighten after we see logs
+const BONDING_REGEX = /(bond|bonded|bonding|complete|completed|enable|enabled)/i;
 
+const STATE_FILE = "last-pump.json";
 function loadState() {
-  if (!fs.existsSync(STATE_FILE)) return { seen: {} };
-  try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); } catch { return { seen: {} }; }
-}
-function saveState(s) { fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 2)); }
-
-async function fetchRecent() {
-  const out = [];
-  for (const pid of PUMP_PROGRAM_IDS) {
-    const url = `https://api.helius.xyz/v0/addresses/${pid}/transactions?api-key=${HELIUS_KEY}&limit=20`;
-    const res = await fetch(url);
-    if (!res.ok) { console.error("Helius error:", res.status); continue; }
-    const txs = await res.json();
-    for (const tx of txs) {
-      const logs = tx?.meta?.logMessages?.join(' ') || '';
-      if (/bond|complete|enabled/i.test(logs)) {
-        const mint = tx?.tokenTransfers?.[0]?.mint || null;
-        if (mint) out.push({ mint });
-      }
-    }
-  }
-  return out;
-}
-
-async function addCoin(c) {
-  const body = { addCoin: { mint: c.mint, name: `Pump ${c.mint.slice(0,4)}`, symbol: "" } };
   try {
-    const res = await fetch(API, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
+    return JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+  } catch {
+    return { seen: {} };
+  }
+}
+function saveState(s) {
+  fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 2));
+}
+
+async function fetchRecentFor(addr) {
+  const url = `https://api.helius.xyz/v0/addresses/${addr}/transactions?api-key=${HELIUS_KEY}&limit=25`;
+  console.log(`[scan] GET ${url.replace(/\?.*/, "?api-key=***")}`);
+  const res = await fetch(url);
+  if (!res.ok) {
+    console.error("[scan] Helius error", res.status, await res.text());
+    return [];
+  }
+  const txs = await res.json();
+  console.log(`[scan] ${addr} -> ${txs.length} txs`);
+  return txs;
+}
+
+// Extract a candidate mint if Helius parsed tokenTransfers for this tx
+function mintFromTx(tx) {
+  // prefer first token transfer mint if present
+  const m =
+    tx?.tokenTransfers?.[0]?.mint ||
+    tx?.events?.nft?.mint ||
+    tx?.events?.token?.mint ||
+    null;
+  return m || null;
+}
+
+async function addCoin(mint) {
+  const body = { addCoin: { mint, name: `Pump ${mint.slice(0,4)}`, symbol: "" } };
+  try {
+    const r = await fetch(API, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
     });
-    if (!res.ok) console.error("AddCoin error", res.status);
-    else console.log("Added coin", c.mint);
-  } catch (e) { console.error("AddCoin failed", e); }
+    const text = await r.text();
+    if (!r.ok) {
+      console.error("[scan] addCoin failed", r.status, text);
+      return false;
+    }
+    console.log("[scan] addCoin ok", mint, text);
+    return true;
+  } catch (e) {
+    console.error("[scan] addCoin exception", e);
+    return false;
+  }
 }
 
 async function main() {
   const state = loadState();
-  const recent = await fetchRecent();
-  for (const c of recent) {
-    if (state.seen[c.mint]) continue;
-    await addCoin(c);
-    state.seen[c.mint] = Date.now();
+
+  for (const pid of CANDIDATE_PROGRAMS) {
+    const txs = await fetchRecentFor(pid);
+
+    for (const tx of txs) {
+      const sig = tx?.signature || "(no sig)";
+      const logs = tx?.meta?.logMessages || [];
+      const joined = logs.join(" | ");
+
+      // print a compact preview to learn what logs look like
+      const preview = logs.slice(0, 3).join(" / ");
+      console.log(`\n[scan] tx ${sig}`);
+      console.log(`[scan]   preview logs: ${preview || "(no logs)"}`);
+
+      // First pass: look for any “bonding-ish” words
+      if (!BONDING_REGEX.test(joined)) continue;
+
+      const mint = mintFromTx(tx);
+      console.log(`[scan]   bonding-ish hit. inferred mint: ${mint || "(none)"}`);
+
+      if (!mint) {
+        // We matched the logs but couldn’t infer mint. Print more to debug.
+        console.log("[scan]   FULL LOGS:", joined);
+        continue;
+      }
+
+      if (state.seen[mint]) {
+        console.log("[scan]   already seen", mint);
+        continue;
+      }
+
+      const ok = await addCoin(mint);
+      if (ok) {
+        state.seen[mint] = Date.now();
+      }
+    }
   }
+
   saveState(state);
+  console.log("[scan] done");
 }
 
-main().catch(e => { console.error(e); process.exit(1); });
+main().catch((e) => {
+  console.error(e);
+  process.exit(1);
+});
