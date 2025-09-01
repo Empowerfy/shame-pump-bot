@@ -1,6 +1,7 @@
 // scan.js - polls Helius for Pump.fun coins and adds them to Google Sheets
 import fs from 'fs';
-const fetch = globalThis.fetch; // Node 18+ builtin
+const fetch = globalThis.fetch; // no node-fetch import
+
 
 
 const HELIUS_KEY = process.env.HELIUS_KEY;
