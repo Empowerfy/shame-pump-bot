@@ -1,0 +1,19 @@
+name: Pump Scan
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # every 15 minutes
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Run scanner
+        run: node scan.js
+        env:
+          HELIUS_KEY: ${{ secrets.HELIUS_KEY }}
+          APPS_SCRIPT_API: ${{ secrets.APPS_SCRIPT_API }}
