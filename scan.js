@@ -17,7 +17,7 @@ console.log("[scan] APPS_SCRIPT_API: ", API);
 // NOTE: Pump.fun’s public “program id” people paste online is often wrong.
 // We’ll probe a few known/seen ids. We’ll learn the right one from logs.
 const CANDIDATE_PROGRAMS = [
-  "Pump111111111111111111111111111111111111111", // common placeholder people quote
+  "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P", // common placeholder people quote
   // add more if you know them:
   // "2oE5k........",  // (example)
 ];
